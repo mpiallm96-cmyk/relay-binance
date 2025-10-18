@@ -4,7 +4,7 @@ import os, time, requests, math
 app = Flask(__name__)
 
 # ============== CONFIGURAÇÕES GERAIS ==============
-BINANCE_BASE = os.getenv("BINANCE_BASE_URL", "https://fapi.binance.com/fapi/v1")
+BINANCE_BASE = os.getenv("BINANCE_BASE_URL", "https://api.binance.com/api/v3")
 DEFAULT_INTERVAL = "5m"
 INTERVAL_MS = 5 * 60 * 1000
 DEFAULT_N = int(os.getenv("SNAPSHOT_N", "50"))
