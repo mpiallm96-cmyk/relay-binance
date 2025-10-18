@@ -12,6 +12,12 @@ DEFAULT_N = int(os.getenv("SNAPSHOT_N", "50"))        # velas fechadas no snapsh
 HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT", "8.0"))
 AGG_LIMIT = int(os.getenv("AGG_LIMIT", "1000"))       # máx por chamada do /aggTrades
 
+# Thresholds configuráveis (guard-rails)
+DIST_MIN = float(os.getenv("DIST_MIN", "0.25"))           # distância mínima normalizada à EMA200(H1)
+SPREAD_MAX_BPS = float(os.getenv("SPREAD_MAX_BPS", "3.0"))
+MIN_DEPTH_QTY = float(os.getenv("MIN_DEPTH_QTY", "50"))   # heurístico - ajuste por par
+ATR_M5_PCTL_MIN = float(os.getenv("ATR_M5_PCTL_MIN", "0.20"))
+
 # Sessão HTTP reusável
 session = requests.Session()
 
@@ -61,6 +67,155 @@ def fetch_klines_closed(symbol: str, n: int) -> list:
         raise RuntimeError("no closed candles yet")
     return closed[-n:]  # últimas n fechadas
 
+# ======== Novos Helpers de série / indicadores ========
+def ema(values: list, period: int) -> float:
+    """EMA simples: retorna o último valor da EMA(period) de uma lista de closes (floats)."""
+    if not values or period <= 1 or len(values) < period:
+        return 0.0
+    k = 2.0 / (period + 1)
+    e = values[0]
+    for v in values[1:]:
+        e = v * k + e * (1 - k)
+    return e
+
+def fetch_klines_closed_interval(symbol: str, interval: str, n: int) -> list:
+    """Versão com intervalo parametrizável (ex.: '1h' para H1)."""
+    body, status = _binance_get("/klines", {"symbol": symbol, "interval": interval, "limit": n + 2})
+    if status != 200:
+        raise RuntimeError(f"klines upstream {status}")
+    raw = body
+    t_now = now_ms()
+    closed = []
+    for i, row in enumerate(raw):
+        open_time = int(row[0])
+        # close_time = próximo open_time quando disponível; senão, estima pelo delta das últimas
+        if i + 1 < len(raw):
+            close_time = int(raw[i + 1][0])
+        else:
+            if i > 0:
+                dt = int(row[0]) - int(raw[i - 1][0])
+            else:
+                dt = INTERVAL_MS
+            close_time = open_time + dt
+        if close_time <= t_now:
+            closed.append({
+                "open_time": open_time,
+                "close_time": close_time,
+                "open":  str(row[1]),
+                "high":  str(row[2]),
+                "low":   str(row[3]),
+                "close": str(row[4]),
+                "volume": str(row[5]),
+            })
+    if not closed:
+        raise RuntimeError("no closed candles yet")
+    return closed[-n:]
+
+def slope_dir(series: list, lookback: int = 5) -> int:
+    """+1 se último > valor de lookback atrás, -1 se menor, 0 se ~igual (tolerância pequena)."""
+    if len(series) <= lookback:
+        return 0
+    a = series[-1]
+    b = series[-1 - lookback]
+    tol = max(1e-9, abs(a) * 1e-4)
+    if a > b + tol: return +1
+    if a < b - tol: return -1
+    return 0
+
+def depth_snapshot(symbol: str, limit: int = 5):
+    """Pega /depth e calcula IB e spread bps."""
+    body, status = _binance_get("/depth", {"symbol": symbol, "limit": limit})
+    if status != 200:
+        return None
+    bids = body.get("bids", [])
+    asks = body.get("asks", [])
+    def _sum(levels):
+        s = 0.0
+        for p, q in levels:
+            s += float(q)
+        return s
+    bid_sum = _sum(bids)
+    ask_sum = _sum(asks)
+    ib = 0.0
+    denom = bid_sum + ask_sum
+    if denom > 0:
+        ib = (bid_sum - ask_sum) / denom
+    # spread bps:
+    if bids and asks:
+        best_bid = float(bids[0][0])
+        best_ask = float(asks[0][0])
+        mid = (best_bid + best_ask) / 2.0
+        spread_bps = 0.0 if mid == 0 else (best_ask - best_bid) / mid * 1e4
+    else:
+        spread_bps = 1e9
+    # profundidade top-5 em "quantidade" (soma de qty; serve como heurística)
+    depth_top5_qty = bid_sum + ask_sum
+    return {"IB": ib, "spread_bps": spread_bps, "depth_top5_qty": depth_top5_qty}
+
+def atr14_from_candles(candles: list) -> float:
+    """ATR(14) simples usando TR padrão sobre os candles fornecidos (list de dict)."""
+    if len(candles) < 15:
+        return 0.0
+    trs = []
+    prev_close = None
+    for c in candles:
+        h = float(c["high"])
+        l = float(c["low"])
+        cl = float(c["close"])
+        if prev_close is None:
+            tr = h - l
+        else:
+            tr = max(h - l, abs(h - prev_close), abs(l - prev_close))
+        trs.append(tr)
+        prev_close = cl
+    return sum(trs[-14:]) / 14.0
+
+def agg_stats_for_window(symbol: str, start_ms: int, end_ms: int):
+    """Computa buy_vol, sell_vol, %Agg e delta na janela [start, end)."""
+    agg = fetch_agg_trades_window(symbol, start_ms, end_ms, per_req=AGG_LIMIT)
+    buy_vol = sell_vol = 0.0
+    if agg:
+        for t in agg:
+            qty = float(t["q"])
+            is_buyer_maker = bool(t.get("m", False))  # m=True => agressor foi vendedor
+            if is_buyer_maker:
+                sell_vol += qty
+            else:
+                buy_vol += qty
+    total = buy_vol + sell_vol
+    pct_aggressive_buy = (buy_vol / total * 100.0) if total > 0 else 0.0
+    return {
+        "buy_vol": buy_vol,
+        "sell_vol": sell_vol,
+        "pct_agg_buy": pct_aggressive_buy,
+        "delta": buy_vol - sell_vol
+    }
+
+def zscore(value: float, series: list) -> float:
+    """z-score simples do value contra series (média e desvio da série)."""
+    import math
+    if not series or len(series) < 2:
+        return 0.0
+    m = sum(series) / len(series)
+    var = sum((x - m) ** 2 for x in series) / (len(series) - 1)
+    sd = math.sqrt(max(var, 1e-12))
+    return (value - m) / sd
+
+def deltas_last_k_m5(symbol: str, candles_m5: list, k: int = 12) -> list:
+    """
+    Retorna lista de deltas das últimas k velas M5 (anteriores à última).
+    Usa aggTrades por vela fechada.
+    """
+    out = []
+    take = min(k, max(0, len(candles_m5) - 1))
+    if take == 0:
+        return out
+    window = candles_m5[-(take+1):-1]
+    for c in window:
+        stats = agg_stats_for_window(symbol, c["open_time"], c["close_time"])
+        out.append(stats["delta"])
+    return out
+
 def fetch_agg_trades_window(symbol: str, start_ms: int, end_ms: int, per_req: int = AGG_LIMIT) -> list:
     """
     Busca aggTrades cobrindo a janela [start_ms, end_ms).
@@ -90,23 +245,38 @@ def fetch_agg_trades_window(symbol: str, start_ms: int, end_ms: int, per_req: in
         params["startTime"] = next_start
     return out
 
-def atr14_from_candles(candles: list) -> float:
-    """ATR(14) simples usando TR padrão sobre os candles fornecidos (list de dict)."""
-    if len(candles) < 15:
-        return 0.0
-    trs = []
-    prev_close = None
-    for c in candles:
-        h = float(c["high"])
-        l = float(c["low"])
-        cl = float(c["close"])
-        if prev_close is None:
-            tr = h - l
+def compute_regime_h1(symbol: str):
+    """
+    Calcula EMA200(H1), slope (±1/0), ATR14(H1), distância normalizada e flags de regime.
+    """
+    candles_h1 = fetch_klines_closed_interval(symbol, "1h", 250)
+    closes = [float(c["close"]) for c in candles_h1]
+    ema200 = ema(closes, 200)
+    # série de EMA200 ao longo do tempo para medir direção (com lookback de 5 candles H1)
+    ema200_series = []
+    e = None
+    k = 2.0 / (200 + 1)
+    for i, v in enumerate(closes):
+        if i == 0:
+            e = v
         else:
-            tr = max(h - l, abs(h - prev_close), abs(l - prev_close))
-        trs.append(tr)
-        prev_close = cl
-    return sum(trs[-14:]) / 14.0
+            e = v * k + e * (1 - k)
+        ema200_series.append(e if i + 1 >= 1 else 0.0)
+    slope = slope_dir(ema200_series, lookback=5)
+    atr_h1 = atr14_from_candles(candles_h1)
+    last_close = closes[-1]
+    dist_norm = 0.0 if atr_h1 <= 0 else abs(last_close - ema200) / atr_h1
+    regime_above = last_close > ema200
+    regime_below = last_close < ema200
+    return {
+        "ema200_h1": ema200,
+        "ema200_h1_slope": slope,   # +1 / 0 / -1
+        "close_h1": last_close,
+        "atr14_h1": atr_h1,
+        "distance_to_ema200_h1": dist_norm,
+        "regime_above": regime_above,
+        "regime_below": regime_below
+    }
 
 # ============== Rotas originais (proxy) ==============
 @app.route("/")
@@ -162,47 +332,98 @@ def m5_snapshot():
     last_open = int(last["open_time"])
     last_close = int(last["close_time"])
 
-    # fluxo na janela da última M5 com aggTrades (startTime/endTime)
+    # ===== 4.1 Regime H1 (EMA200, slope, distância) =====
     try:
-        agg = fetch_agg_trades_window(symbol, last_open, last_close, per_req=AGG_LIMIT)
-        buy_vol = sell_vol = 0.0
-        coverage = "unknown"
-        if agg:
-            tmin = min(int(t.get("T", last_open)) for t in agg)
-            tmax = max(int(t.get("T", last_open)) for t in agg)
-            for t in agg:
-                qty = float(t["q"])
-                is_buyer_maker = bool(t.get("m", False))  # m=True => agressor foi vendedor
-                if is_buyer_maker:
-                    sell_vol += qty
-                else:
-                    buy_vol += qty
-            # heurística de cobertura: vimos início e fim da janela?
-            coverage = "full" if (tmin <= last_open + 30_000 and tmax >= last_close - 30_000) else "partial"
-        else:
-            buy_vol = sell_vol = 0.0
-            coverage = "unknown"
+        regime = compute_regime_h1(symbol)
+    except Exception as e:
+        regime = {
+            "ema200_h1": 0.0, "ema200_h1_slope": 0, "close_h1": 0.0,
+            "atr14_h1": 0.0, "distance_to_ema200_h1": 0.0,
+            "regime_above": False, "regime_below": False, "error": str(e)
+        }
+
+    # ===== 4.2 Fluxo da última M5 (aggTrades) =====
+    try:
+        flow_last = agg_stats_for_window(symbol, last_open, last_close)  # buy/sell/pctAgg/delta
+        # série de deltas das últimas k velas para z-score (proxy de OFI_z)
+        deltas_hist = deltas_last_k_m5(symbol, candles, k=12)
+        ofi_z_proxy = zscore(flow_last["delta"], deltas_hist) if deltas_hist else 0.0
+        coverage = "full"
     except Exception:
-        buy_vol = sell_vol = 0.0
+        flow_last = {"buy_vol": 0.0, "sell_vol": 0.0, "pct_agg_buy": 0.0, "delta": 0.0}
+        ofi_z_proxy = 0.0
         coverage = "unknown"
 
+    # ===== 4.3 ATRs e "mercado morto" =====
+    atr_m5 = atr14_from_candles(candles)
+    # série de ATRs progressivos para rank (proxy de percentil)
+    atr_series = []
+    for i in range(1, len(candles)):
+        atr_series.append(atr14_from_candles(candles[:i+1]))
+    def _percentile_rank(series, value):
+        if not series:
+            return 1.0
+        below = sum(1 for x in series if x <= value)
+        return below / len(series)
+    atr_m5_pct = _percentile_rank(atr_series[-50:], atr_m5)  # usa ~50 últimas leituras
+
+    # ===== 4.4 Depth snapshot -> IB e spread =====
+    depth = depth_snapshot(symbol, limit=5) or {"IB": 0.0, "spread_bps": 1e9, "depth_top5_qty": 0.0}
+
+    # ===== 4.5 Guards (regras duras) =====
+    distance_ok = (regime.get("atr14_h1", 0) > 0) and (regime["distance_to_ema200_h1"] >= DIST_MIN)
+    spread_ok = (depth["spread_bps"] <= SPREAD_MAX_BPS)
+    depth_ok = (depth["depth_top5_qty"] >= MIN_DEPTH_QTY)
+    market_ok = (atr_m5_pct >= ATR_M5_PCTL_MIN)
+
+    guards = {
+        "distance_ok": distance_ok,
+        "spread_ok": spread_ok,
+        "depth_ok": depth_ok,
+        "market_ok": market_ok,
+        "distance_to_EMA200_H1": regime["distance_to_ema200_h1"],
+        "atr_m5_percentile": atr_m5_pct,
+        "spread_bps": depth["spread_bps"],
+        "depth_top5_qty": depth["depth_top5_qty"]
+    }
+
+    # ===== 4.6 Montagem do payload =====
     payload = {
         "symbol": symbol,
         "interval": DEFAULT_INTERVAL,
         "server_time": t_now,
-        "candles": candles,  # exatamente n velas fechadas
+        "candles": candles,  # exatamente n velas fechadas (M5)
         "flow_last_candle": {
             "open_time": last_open,
             "close_time": last_close,
-            "buy_volume": buy_vol,
-            "sell_volume": sell_vol,
+            "buy_volume": flow_last["buy_vol"],
+            "sell_volume": flow_last["sell_vol"],
+            "pct_aggressive_buy": flow_last["pct_agg_buy"],
+            "delta": flow_last["delta"],
+            "ofi_z_proxy": ofi_z_proxy,
             "coverage": coverage
         },
         "indicators": {
-            "atr14_m5": atr14_from_candles(candles)
+            "atr14_m5": atr_m5
         },
+        "regime_h1": {
+            "ema200": regime["ema200_h1"],
+            "slope_dir": regime["ema200_h1_slope"],   # +1/0/-1
+            "close": regime["close_h1"],
+            "atr14_h1": regime["atr14_h1"],
+            "distance_to_ema200": regime["distance_to_ema200_h1"],
+            "regime_above": regime["regime_above"],
+            "regime_below": regime["regime_below"]
+        },
+        "depth_snapshot": {
+            "IB": depth["IB"],
+            "spread_bps": depth["spread_bps"],
+            "depth_top5_qty": depth["depth_top5_qty"]
+        },
+        "guards": guards,
         "meta": {
-            "data_version": "snap_1.0"
+            "data_version": "snap_1.1",
+            "notes": "inclui regime H1, proxies de fluxo e guard-rails"
         }
     }
 
